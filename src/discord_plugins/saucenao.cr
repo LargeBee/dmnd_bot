@@ -50,6 +50,7 @@ module Saucenao
     FurAffinity           # 40
     Twitter               # 41
     Furry_Network         # 42
+    Mangadex1 = 371       # 371
 
     def to_json(io)
       io << '"'
@@ -93,7 +94,7 @@ module Saucenao
   class ResultData
     include JSON::Serializable
     @[JSON::Field(key: "ext_urls")]
-    getter ext_urls : Array(String)
+    getter ext_urls : Array(String)?
 
     # optional stuff
     @[JSON::Field(key: "title")]
@@ -171,7 +172,7 @@ module Saucenao
     @[JSON::Field(key: "bcy_id")]
     getter bcy_id : Int32?
     @[JSON::Field(key: "bcy_type")]
-    getter bcy_type : Int32?
+    getter bcy_type : String?
 
     # # Seiga
     @[JSON::Field(key: "seiga_id")]
@@ -185,9 +186,9 @@ module Saucenao
     @[JSON::Field(key: "anilist_id")]
     getter anilist_id : Int32?
     @[JSON::Field(key: "part")]
-    getter part : Int32?
+    getter part : String?
     @[JSON::Field(key: "year")]
-    getter year : Int32?
+    getter year : String?
     @[JSON::Field(key: "est_time")]
     getter est_time : String?
   end
@@ -201,7 +202,7 @@ module Discord
       api_endpoint.query_params = URI::Params{
         "output_type" => 2.to_s,
         "api_key"     => token,
-        "dedupe"      => true.to_s,
+        "dedupe"      => 2.to_s,
       }
       super(commands: Set{"sauce"}, name: "SauceNAO", passive: true)
     end
@@ -223,26 +224,43 @@ module Discord
     end
 
     def passive(client, payload)
-      output = "Sources:\n"
       images = 0
+      threshold = 65.5
+
+
+      output = "Sources:\n"
 
       payload.embeds.each do |embed|
         url = embed.url
         unless url.nil?
-          body = construct_body(url)
-          if body
+          body = construct_body(url, threshold: threshold)
+          unless body.strip.empty?
+            saucenao_url = api_endpoint.dup
+            q = saucenao_url.query_params
+            q.delete("api_key")
+            q["output_type"] = 0.to_s
+            q.add("url", url)
+            saucenao_url.query_params = q
+  
             images += 1
-            output += body
+            output += "(from: #{saucenao_url})\n" + body
           end
         end
       end
 
       payload.attachments.each do |attachment|
-        body = construct_body(attachment.url)
+        body = construct_body(attachment.url, threshold: threshold)
         Log.info { attachment.url.to_s }
-        if body
+        unless body.strip.empty?
+          saucenao_url = api_endpoint.dup
+          q = saucenao_url.query_params
+          q.delete("api_key")
+          q["output_type"] = 0.to_s
+          q.add("url", attachment.url)
+          saucenao_url.query_params = q
+
           images += 1
-          output += body
+          output += "(from: #{saucenao_url})\n" + body
         end
       end
       
@@ -251,14 +269,21 @@ module Discord
       end
     end
 
-    def construct_body(image_link : URI | String, limit : Int32 = 1)
+    def construct_body(image_link : URI | String, limit : Int32 = 0, threshold : Float64 = 0)
       output = ""
       api_url = get_url image_link
       sauce = get_sauce api_url
       if sauce
+        sauce.results.sort_by! { |result| result.header.similiarty }
+        sauce.results.reverse!
         sauce.results[..limit].each do |result|
-          output += "Similiarity #{result.header.similiarty}% "
-          case result.header.similiarty
+          similarity = result.header.similiarty
+          data = result.data
+          if similarity < threshold
+            Log.info { "Threshold not met!" }
+            next
+          end
+          case similarity
           when 0..60
             output += "🔴"
           when 60..80
@@ -268,8 +293,15 @@ module Discord
           when 90..
             output += "🟢"
           end
+          output += " Similiarity #{similarity}% "
+          case result.header.index_id
+          when Saucenao::IndexSite::Anime
+            output += "\n🎞️ #{data.source} Episode #{data.part} - #{data.est_time}\n"
+          end
           urls = result.data.ext_urls
-          urls.each { |url| output += "Link: <#{url}>\n" }
+          unless urls.nil?
+            urls.each { |url| output += "Link: <#{url}>\n" }
+          end
         end
       end
       output
@@ -286,7 +318,17 @@ module Discord
     def get_sauce(url : URI) : Saucenao::Parser | Nil
       Log.info { "getting sauce for: #{url}" }
       response = HTTP::Client.get url
-      Saucenao::Parser.from_json response.body
+      if response.status_code==200
+        begin
+          Saucenao::Parser.from_json response.body
+        rescue exception: JSON::SerializableError
+          Log.error(exception:exception) { "Could not decode json!" }
+          Log.error { response.body }
+        end
+      else 
+        Log.warn { "Saucenao responded with #{response.status_code}"}
+        Log.debug { response.body }
+      end
     end
   end
 end
